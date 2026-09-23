@@ -683,10 +683,32 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const bool defer_out_ids = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
 
     // ---- eh_proj: seed the hc residual from (token embedding, target hidden state) ------------
-    // nextn.hnorm is a grouped { n_embd, hc } gamma (checkpoint: [10240] = n_embd*hc), matching
-    // hc_attn_norm / hc_ffn_norm / nextn.hc_head_norm. nextn.enorm is scalar { n_embd } because it
-    // normalises the token embedding BEFORE the hc broadcast. The asymmetry is in the checkpoint.
-    ggml_tensor * h_norm = build_norm(h_state, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il); // [n_embd, hc, n_tokens]
+    // nextn.hnorm is a { n_embd, hc } gamma (checkpoint: [10240] = n_embd*hc) and nextn.enorm is
+    // scalar { n_embd } because enorm normalises the token embedding BEFORE the hc broadcast.
+    //
+    // The REDUCTION width is the subtle part and does not follow the trunk. ik_llama.cpp's
+    // qwen4exp_grouped_rms() (src/graphs/build_qwen4exp.cpp) reduces the trunk's hc norms
+    // PER-LANE over n_embd and then applies the wider hc_dim gamma -- "the [hc_dim] gamma is
+    // wider than the per-stream reduction". But its MTP path (same file, ~:570) reduces the
+    // hidden stream JOINTLY over hc_dim before the reshape. Reducing per-lane here is a silent
+    // numerical divergence: it still drafts, just worse.
+    // MEASURED 2026-09-23: reducing per-lane (over n_embd) beats reducing jointly (over hc_dim) on
+    // this checkpoint in all 8 paired cells of a {prose,code} x {10k,50k,120k,200k} sweep, mean
+    // +0.053 draft acceptance, sign test p~0.004. ik_llama.cpp's MTP path reduces JOINTLY
+    // (build_inp_mtp_states() hands ggml_rms_norm a 2-D [hc_dim, n_tokens] tensor) while its trunk
+    // reduces per-lane via qwen4exp_grouped_rms(); that split does not reproduce here. An
+    // independent second port of this head landed on per-lane too. Set QWEN4EXP_MTP_HNORM_JOINT=1
+    // to re-run the negative result.
+    ggml_tensor * h_norm;
+    if (getenv("QWEN4EXP_MTP_HNORM_JOINT")) {
+        const int64_t hc_dim = (int64_t) n_embd * hc;
+        ggml_tensor * h_flat = ggml_reshape_2d(ctx0, h_state, hc_dim, n_tokens);
+        h_flat = ggml_rms_norm(ctx0, h_flat, hparams.f_norm_rms_eps);
+        h_flat = ggml_mul(ctx0, h_flat, ggml_reshape_1d(ctx0, layer.nextn.hnorm, hc_dim));
+        h_norm = ggml_reshape_3d(ctx0, h_flat, n_embd, hc, n_tokens);
+    } else {
+        h_norm = build_norm(h_state, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);      // [n_embd, hc, n_tokens]
+    }
     cb(h_norm, "mtp_hnorm", il);
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il); // [n_embd, n_tokens]
