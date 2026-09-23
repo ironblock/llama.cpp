@@ -53,6 +53,10 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
+    // NextN/MTP: optional. A plain trunk GGUF has no nextn block; a head-only
+    // sidecar declares block_count = n_layer + n_layer_nextn.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
@@ -150,6 +154,16 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
+    // A head-only MTP sidecar carries blk.<n_main>.* but none of the trunk blocks.
+    // Detect it the way every other NextN arch does, and make the trunk optional.
+    if (hparams.n_layer_nextn > 0 && ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", n_layer).str().c_str()) == nullptr) {
+        hparams.n_layer_nextn = 0;
+    }
+    const bool mtp_only = (hparams.n_layer_nextn > 0) &&
+                          (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
+    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    const int  mtp_flags   = !ml.load_mtp ? TENSOR_SKIP : 0;
+
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
@@ -158,9 +172,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
-    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
-    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
-    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
+    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | trunk_flags);
+    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
+    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
@@ -168,7 +182,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     }
 
     // flat [ple_head_dim, n_rows] gather target
-    if (hparams.ple_n_heads > 0) {
+    if (!mtp_only && hparams.ple_n_heads > 0) {
         // the head ranges are what the gather indexes, so they set the minimum row count
         int64_t ple_rows = 0;
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
@@ -189,7 +203,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
     }
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < (mtp_only ? 0 : n_layer); ++il) {
         auto & layer = layers[il];
 
         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
@@ -256,9 +270,65 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
     }
+
+    // NextN / MTP block(s), appended after the trunk in layers[].
+    // Structurally a full qwen4exp block (QSA attention + MoE + both HC modules)
+    // plus the eh_proj/enorm/hnorm trio and its own HC head mixer.
+    for (uint32_t k = 0; k < hparams.n_layer_nextn; ++k) {
+        const int il = n_layer + k;
+        auto & layer = layers[il];
+
+        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
+        const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+
+        layer.nextn.eh_proj   = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2*n_embd, n_embd }, mtp_flags);
+        layer.nextn.enorm     = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, mtp_flags);
+        layer.nextn.hnorm     = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { n_embd, hc }, mtp_flags|TENSOR_ALLOW_RESHAPE);
+        layer.nextn.embed_tokens = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS, "weight", il), { n_embd, n_vocab }, mtp_flags|TENSOR_NOT_REQUIRED);
+
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, mtp_flags|TENSOR_ALLOW_RESHAPE);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mtp_flags);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mtp_flags);
+
+        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, mtp_flags|TENSOR_ALLOW_RESHAPE);
+        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, mtp_flags);
+        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, mtp_flags);
+        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, mtp_flags);
+        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { n_embd, hc }, mtp_flags|TENSOR_ALLOW_RESHAPE);
+        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, mtp_flags);
+        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, mtp_flags);
+        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, mtp_flags);
+
+        // the NextN block is a full-attention block (never delta-net)
+        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
+
+        // the sidecar ships indexer weights; they are loaded but unused by graph_mtp
+        const int64_t idx_dim = hparams.indexer_head_size;
+        layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il), { n_embd, idx_dim }, mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, mtp_flags|TENSOR_NOT_REQUIRED);
+
+        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_flags);
+
+        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, mtp_flags);
+        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, mtp_flags);
+        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, mtp_flags);
+        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, mtp_flags);
+    }
+
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
+
     return std::make_unique<graph>(*this, params);
 }
 
@@ -350,6 +420,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
+// Build-nothing ctor: bring up the graph context and the `model` reference that the helpers
+// below read, WITHOUT emitting the trunk body, so graph_mtp can reuse build_hc_mix /
+// build_hc_combine / build_layer_ffn.
+//
+// llm_build_delta_net_base is graph's only base and its sole ctor is
+//   llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
+// -- it has no data members and emits no nodes.  llm_graph_context's ctor only caches
+// hparams/cparams/ubatch/ctx0/gf and calls res->set_params(params), which therefore still
+// happens exactly once along the single linear base chain.
+//
+// deepseek4 can use a plain params-only overload because its graph stores no model and passes
+// it to every helper explicitly.  Ours keeps `const llama_model & model` as its LAST member --
+// build_layer_ffn() reads model.layers[il] through it -- and a reference member must be
+// initialised in *every* ctor, so the extra argument cannot simply be dropped; hence the tag.
+// Base first, then `model`, matching declaration order (no -Wreorder).  qsa_inps and rs_rows
+// are std::map and default-construct empty, which is exactly what the MTP head wants: it
+// builds no QSA input sets and no recurrent-state row gathers.
+llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params, mtp_tag) :
+    llm_build_delta_net_base(params), model(model) {
+}
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -391,6 +482,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
 
+    // NextN/MTP: llama_context copies t_h_nextn with one row per *token* when the mask is off
+    // and one row per *output* when it is on. In the unmasked mode the last layer's row gather
+    // therefore has to wait until after the export below, so that the exported residual still
+    // covers all n_tokens rows. Ordinary decoding (embeddings_nextn off) and the masked mode
+    // keep the cheap in-loop gather: deferring it would push the last layer's second
+    // build_hc_combine, the ffn-side build_hc_mix and the whole MoE build_layer_ffn onto
+    // n_tokens rows.
+    const bool defer_out_ids = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
@@ -414,7 +514,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !defer_out_ids) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -442,6 +542,33 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(res_hc, "l_last", il);
     }
 
+    // NextN/MTP: the draft head consumes the PRE-COLLAPSE hyper-connection residual.
+    // llama_context reads it as a flat run of hparams.n_embd_out() == dsv4_hc_mult*n_embd
+    // floats per row from offset 0, with
+    //   n_rows = embeddings_nextn_masked ? n_outputs : ubatch.n_tokens.
+    // res_hc is a real, contiguous [n_embd, hc, T] node (the ggml_add / ggml_dsv4_hc_post out
+    // of build_hc_combine), so its byte layout already IS [n_embd*hc, T]: export it directly
+    // instead of a ggml_reshape_2d view of it. t_h_nextn gets GGML_TENSOR_FLAG_OUTPUT, which
+    // is cleanest on a tensor that owns its storage.
+    //   masked   -> the in-loop gather ran, T == n_outputs
+    //   unmasked -> the gather was deferred to here, T == n_tokens
+    if (cparams.embeddings_nextn) {
+        GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) &&
+                "QWEN4EXP nextn export width must be dsv4_hc_mult*n_embd");
+
+        cb(res_hc, "h_nextn", -1);
+        res->t_h_nextn = res_hc;
+
+        // the deferred half of the row masking: everything below is per output row.
+        // ggml_get_rows is 2-D, so flatten, gather, and re-inflate - the final reshape reads
+        // the gathered tensor's own ne[1], not n_outputs.
+        if (defer_out_ids && inp_out_ids) {
+            ggml_tensor * flat = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+            flat   = ggml_get_rows(ctx0, flat, inp_out_ids);
+            res_hc = ggml_reshape_3d(ctx0, flat, n_embd, hc, flat->ne[1]);
+        }
+    }
+
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
@@ -451,6 +578,303 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// LLM_GRAPH_TYPE_DECODER_MTP draft head for the qwen4exp NextN sidecar block.
+//
+// The head is one full qwen4exp block - both hyper-connection modules, dense attention and the
+// MoE ffn - but seeded from (draft token embedding, target hidden state) instead of from the
+// token embedding alone, and collapsed by the block's own HC head mixer.
+//
+// The MTP context owns a PLAIN llama_kv_cache (llama-model.cpp create_memory, the
+// LLAMA_CONTEXT_TYPE_MTP branch, filtered to il >= hparams.n_layer()), NOT the trunk's
+// llama_memory_hybrid_idx. build_layer_attn() therefore cannot be reused: it takes a
+// const llama_memory_hybrid_idx_context * and dereferences it unconditionally
+// (`mctx_hyb->get_idx()`) to choose QSA over dense attention. Everything else in it is
+// hybrid-free, so its dense half is inlined below statement for statement, minus the two QSA
+// lines. build_hc_mix / build_hc_combine / build_layer_ffn have no memory-context dependency
+// at all and are reused as-is - which is what the build-nothing tag ctor exists for.
+llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    graph(model, params, mtp_tag{}) {
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
+    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
+            cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
+            "nextn_layer_offset out of range [0, n_layer_nextn)");
+
+    const int64_t hc = hparams.dsv4_hc_mult;
+
+    // llm_graph_input_embd_h::set_input asserts `n_embd == h->ne[0]` and copies
+    // n_tokens*n_embd floats out of ubatch->embd. For an MTP context that buffer holds the
+    // target's FLAT hyper-connection residual, whose row width llama_context fixes at
+    // hparams.n_embd_out() - see the `mtp_embd` branch in llama_context::decode and the
+    // embd_nextn copy-out. So every width below is n_embd_out() == hc*n_embd, never the plain
+    // `n_embd` member.
+    GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "QWEN4EXP MTP hidden width mismatch");
+
+    // inp->embd and inp->h are both fed from ubatch->embd, which here carries the wide hidden
+    // state and never token embeddings - so the draft token ids must arrive separately. This is
+    // why the `ubatch.token ? get_rows(...) : inp->embd` form that the scalar-width NextN archs
+    // use is wrong here.
+    GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
+
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // the NextN block(s) sit immediately after the trunk in model.layers[]:
+    // hparams.n_layer() is the TRUNK layer count (n_layer_all - n_layer_nextn).
+    const int    il    = hparams.n_layer() + cparams.nextn_layer_offset;
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "QWEN4EXP MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "QWEN4EXP MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "QWEN4EXP MTP block missing nextn.hnorm");
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    // ---- inputs -------------------------------------------------------------------------------
+    // TODO: extract in a common llm_graph_context::build_inp_embd_h()
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);                     // I32 [n_tokens]
+    ggml_set_input(inp->tokens);
+
+    // no graph node reads inp->embd - the assert above guarantees set_input takes the token
+    // branch and never writes it. It is still allocated because llm_graph_input_embd_h::can_reuse
+    // demands a non-null `embd` with ne[1] == n_tokens whenever ubatch.embd is set, and an MTP
+    // ubatch always sets it; dropping it would force a full graph rebuild on every draft decode.
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens); // [hc*n_embd, n_tokens]
+    ggml_set_input(inp->embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);    // [hc*n_embd, n_tokens]
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    // the sidecar may ship its own embedding table; it is TENSOR_NOT_REQUIRED, so fall back to
+    // the trunk's tok_embd the way every other NextN arch does
+    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    GGML_ASSERT(tok_embd_w && "QWEN4EXP MTP missing token embedding table");
+
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);               // [n_embd, n_tokens]
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    // the target's residual arrives flat; re-inflate it into the hc stream layout that every hc
+    // helper expects. reshape only - the byte layout is already [n_embd][hc][token].
+    ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);         // [n_embd, hc, n_tokens]
+    cb(h_state, "mtp_h_state", il);
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // the MTP context owns a PLAIN llama_kv_cache, so the downcast inside build_attn_inp_kv() -
+    // static_cast<const llama_kv_cache_context *>(mctx) - is the right one. Never
+    // build_inp_mem_hybrid() here: there is no hybrid memory and no indexer cache.
+    llm_graph_input_attn_kv * inp_attn = build_attn_inp_kv();
+
+    // same row-masking contract as the trunk: the export below covers n_tokens rows when the
+    // mask is off and n_outputs rows when it is on, so the gather is deferred past it in the
+    // unmasked case and runs early (saving the ffn the dropped rows) in every other case.
+    const bool defer_out_ids = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+
+    // ---- eh_proj: seed the hc residual from (token embedding, target hidden state) ------------
+    // nextn.hnorm is a grouped { n_embd, hc } gamma (checkpoint: [10240] = n_embd*hc), matching
+    // hc_attn_norm / hc_ffn_norm / nextn.hc_head_norm. nextn.enorm is scalar { n_embd } because it
+    // normalises the token embedding BEFORE the hc broadcast. The asymmetry is in the checkpoint.
+    ggml_tensor * h_norm = build_norm(h_state, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il); // [n_embd, hc, n_tokens]
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il); // [n_embd, n_tokens]
+    // the token embedding is scalar-width: materialise one identical copy per hc stream, exactly
+    // the way the trunk seeds its residual from inpL (cb "hc_init")
+    e_norm = ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens);                         // [n_embd, 1,  n_tokens]
+    e_norm = ggml_repeat_4d(ctx0, e_norm, n_embd, hc, n_tokens, 1);                      // [n_embd, hc, n_tokens]
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);                // [2*n_embd, hc, n_tokens]
+    cb(concat, "mtp_concat", il);
+
+    // eh_proj is { 2*n_embd, n_embd }: one mul_mat broadcasts over dim 2, applying the same
+    // scalar-width NextN projection independently to each of the hc streams
+    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s); // [n_embd, hc, n_tokens]
+    cb(res_hc, "mtp_eh_proj", il);
+
+    // ---- attention sub-block ------------------------------------------------------------------
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur    = build_hc_mix(res_hc,
+            layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up,
+            layer.hc_attn_inject, &inject, il);                                  // [n_embd, T], inject [hc, T]
+    cb(cur, "mtp_hc_attn_pre", il);
+
+    {
+        // Qwen3Next uses a single Q projection that outputs query + gate INTERLEAVED per head:
+        // wq is [n_embd, n_embd_head_k*n_head*2] (the NextN block is created with the same
+        // create_tensor_qkv call as a trunk layer), so the two views share the row stride
+        // elsz*n_embd_head*2 and the plane stride elsz*n_embd_head*2*n_head, and differ only in
+        // their byte offset: 0 for the query, elsz*n_embd_head for the gate.
+        ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s); // [(n_embd_head*2)*n_head, n_tokens]
+        cb(Qcur_full, "mtp_Qcur_full", il);
+
+        ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);    // [n_embd_head, n_head, n_tokens]
+        cb(Qcur, "mtp_Qcur_reshaped", il);
+
+        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "mtp_Qcur_normed", il);
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);      // [n_embd_k_gqa, n_tokens]
+        cb(Kcur, "mtp_Kcur", il);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);      // [n_embd_v_gqa, n_tokens]
+        cb(Vcur, "mtp_Vcur", il);
+
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
+
+        ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);                    // [n_embd_head, n_head, n_tokens]
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);    // [n_embd_head*n_head, n_tokens]
+        cb(gate, "mtp_gate_reshaped", il);
+
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        // Apply IMRoPE - Q and K only; V is never roped
+        Qcur = ggml_rope_multi(
+                ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+
+        Kcur = ggml_rope_multi(
+                ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+
+        cb(Qcur, "mtp_Qcur", il);
+        cb(Kcur, "mtp_Kcur", il);
+        cb(Vcur, "mtp_Vcur", il);
+
+        const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+        // wo/wo_b/wo_s are deliberately nullptr: the sigmoid gate is applied to the RAW attention
+        // output, BEFORE the output projection. Letting build_attn fold wo in would swap that
+        // order and silently produce different numbers from the trunk.
+        cur = build_attn(inp_attn,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il); // [n_embd_head*n_head, n_tokens]
+        cb(cur, "mtp_attn_pregate", il);
+
+        ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+        cb(gate_sigmoid, "mtp_gate_sigmoid", il);
+
+        cur = ggml_mul(ctx0, cur, gate_sigmoid);
+        cb(cur, "mtp_attn_gated", il);
+
+        cur = build_lora_mm(layer.wo, cur, layer.wo_s);                     // [n_embd, n_tokens]
+        cb(cur, "mtp_attn_output", il);
+    }
+
+    // same three-tensor gather the trunk runs on its last layer, and for the same reason: the
+    // ffn half below is per token, so drop the rows that produce no output. Deferred only when
+    // the unmasked nextn export downstream still needs all n_tokens rows.
+    if (inp_out_ids && !defer_out_ids) {
+        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);                  // [n_embd, n_out]
+        inject = ggml_get_rows(ctx0, inject, inp_out_ids);                  // [hc,     n_out]
+
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);   // [n_embd*hc, n_tokens]
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);                  // [n_embd*hc, n_out]
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);  // [n_embd, hc, n_out]
+    }
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);                     // [n_embd, hc, T]
+
+    // ---- ffn sub-block ------------------------------------------------------------------------
+    cur = build_hc_mix(res_hc,
+            layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up,
+            layer.hc_ffn_inject, &inject, il);                              // [n_embd, T], inject [hc, T]
+    cb(cur, "mtp_hc_ffn_pre", il);
+
+    // build_layer_ffn is reused VERBATIM: it is pure in (cur, il). It reads only
+    // model.layers[il].{ffn_gate_inp, ffn_{up,gate,down}_exps(_s), ffn_gate_up_exps,
+    // ffn_*_shexp}, the graph-level n_expert/n_expert_used and hparams.expert_weights_scale -
+    // no mctx, no llama_memory_hybrid_idx_context downcast, no rs_rows/qsa_inps - so the
+    // plain-llama_kv_cache MTP context is fine. The NextN slot layers[n_layer + k] is loaded
+    // with the same (required) MoE + shared-expert set as a trunk layer, so the helper's
+    // GGML_ASSERT(ffn_gate_inp != nullptr) holds. Inside, build_moe_ffn/build_ffn index il only
+    // into hparams.swiglu_clamp_{exp,shexp} (std::array<float, LLAMA_MAX_LAYERS>, zeroed at load
+    // and never set for this arch), so il = n_layer + offset is in bounds and takes the same
+    // unclamped swiglu path as the trunk.
+    cur = build_layer_ffn(cur, il);                                         // [n_embd, T]
+    cb(cur, "mtp_ffn_out", il);
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);                     // [n_embd, hc, T]
+    cb(res_hc, "mtp_l_out", il);
+
+    // ---- nextn export -------------------------------------------------------------------------
+    // Chained drafting reads the draft block's own pre-collapse HC residual exactly the way the
+    // target's trunk export is read, so it obeys the same contract, the same gate and the same
+    // real-tensor (never a reshape view) convention. res_hc is the contiguous ggml_add /
+    // ggml_dsv4_hc_post out of build_hc_combine, so its byte layout already IS [n_embd*hc, T].
+    //   masked   -> the gather above ran,           T == n_outputs
+    //   unmasked -> the gather was deferred to here, T == n_tokens
+    if (cparams.embeddings_nextn) {
+        cb(res_hc, "h_nextn", -1);
+        res->t_h_nextn = res_hc;
+
+        if (defer_out_ids && inp_out_ids) {
+            ggml_tensor * flat = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+            flat   = ggml_get_rows(ctx0, flat, inp_out_ids);
+            res_hc = ggml_reshape_3d(ctx0, flat, n_embd, hc, flat->ne[1]);  // [n_embd, hc, n_out]
+        }
+    }
+
+    // ---- output head --------------------------------------------------------------------------
+    // res_hc is this block's HC residual, already gathered: [n_embd, hc, n_out].
+    GGML_ASSERT(res_hc->ne[0] == n_embd && res_hc->ne[1] == hc &&
+            "QWEN4EXP MTP head expects an [n_embd, hc, n_out] residual");
+
+    // The NextN block ships its own HC head mixer and, exactly as in the trunk, that mixer IS the
+    // output norm - qwen4exp has no separate output_norm tensor. Prefer the sidecar triple, fall
+    // back to the trunk's model-level one; this mirrors the nextn.shared_head_norm ->
+    // model.output_norm idiom of deepseek4 and qwen35. One predicate selects all three, so a
+    // sidecar norm can never be paired with the trunk's low-rank down/up.
+    const bool nextn_hc_head = layer.nextn.hc_head_norm != nullptr;
+    GGML_ASSERT(nextn_hc_head == (layer.nextn.hc_head_down != nullptr) &&
+                nextn_hc_head == (layer.nextn.hc_head_up   != nullptr) &&
+                "QWEN4EXP MTP hc head mixer is only partially loaded");
+
+    ggml_tensor * head_norm = nextn_hc_head ? layer.nextn.hc_head_norm : model.hc_head_norm; // [n_embd, hc]
+    ggml_tensor * head_down = nextn_hc_head ? layer.nextn.hc_head_down : model.hc_head_down; // [n_embd*hc, hc_low_rank]
+    ggml_tensor * head_up   = nextn_hc_head ? layer.nextn.hc_head_up   : model.hc_head_up;   // [hc_low_rank, n_embd*hc]
+    GGML_ASSERT(head_norm && head_down && head_up && "QWEN4EXP MTP missing the hc head mixer");
+
+    // argument order is (x, w_norm, w_DOWN, w_UP, w_inject, inject, il) - down before up.
+    // w_inject/inject are null because nothing is scattered back; il = -1 keeps the unfused path
+    // and registers no fused node, exactly as the trunk's final collapse does.
+    cur = build_hc_mix(res_hc, head_norm, head_down, head_up, nullptr, nullptr, -1); // [n_embd, n_out]
+    cb(cur, "mtp_result_norm", -1);
+    res->t_embd = cur;
+
+    // qwen4exp never emits blk.%d.nextn.shared_head_head, and a sidecar's own output.weight is
+    // loaded straight into model.output, so this takes the model.output arm today. Kept as the
+    // in-tree idiom so a checkpoint that does ship a per-block LM head needs no graph change.
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head   : model.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    GGML_ASSERT(head_w && "QWEN4EXP MTP missing the LM head");
+
+    // build_lora_mm, not deepseek4's bare ggml_mul_mat: qwen4exp's trunk carries a per-tensor
+    // output scale and a plain mul_mat would silently drop it.
+    cur = build_lora_mm(head_w, cur, head_s);   // [n_vocab, n_out]
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

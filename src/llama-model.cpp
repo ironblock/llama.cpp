@@ -2562,6 +2562,36 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                    if (arch == LLM_ARCH_QWEN4EXP &&
+                        params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                        hparams.n_layer_nextn > 0) {
+                        // The NextN/MTP draft head is a plain full-attention block
+                        // (no delta-net, and the trunk's QSA indexer cache is not
+                        // reused), so the MTP context gets a plain attention KV cache
+                        // holding only the nextn layer(s).
+                        llama_kv_cache::layer_filter_cb filter_mtp =
+                            [&](uint32_t il) { return il >= hparams.n_layer(); };
+
+                        res = new llama_kv_cache(
+                                *this,
+                                hparams,
+                                params.type_k,
+                                params.type_v,
+                                !cparams.flash_attn,
+                                cparams.offload_kqv,
+                                cparams.kv_unified,
+                                cparams.n_ctx_seq,
+                                cparams.n_seq_max,
+                                1,
+                                hparams.n_swa,
+                                hparams.swa_type,
+                                nullptr,
+                                filter_mtp,
+                                nullptr,
+                                nullptr);
+                        break;
+                    }
+
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
