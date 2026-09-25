@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "dequantize.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
@@ -114,6 +115,118 @@ void ggml_cuda_flash_attn_ext_compact_mask(
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, ncols1, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <typename src_t>
+static __device__ __forceinline__ void flash_attn_convert_unary(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const src_t * x = (const src_t *) vx;
+    v.x = ggml_cuda_cast<float>(x[ib + iqs + 0]);
+    v.y = ggml_cuda_cast<float>(x[ib + iqs + 1]);
+}
+
+// converts the K/V rows referenced by the sparse index lists to f16, one warp per (list, slot, head)
+// the destination is a contiguous [ne0, ne1, ne2, ne3] f16 tensor, rows that no list references are left untouched
+template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
+static __global__ void flash_attn_sparse_rows_to_f16(
+        const char * x, half * y, const int32_t * indices, const int ne0, const int ne1, const int ne2, const int ne3,
+        const int ne33, const int n_lists, const int n_kv_max, const int64_t nb1, const int64_t nb2, const int64_t nb3) {
+    ggml_cuda_pdl_sync();
+
+    const int list = blockIdx.y;
+    const int slot = blockIdx.x*blockDim.y + threadIdx.y;
+    const int i2   = blockIdx.z;
+
+    // list == (sequence % ne33)*iter_j + jt, the K/V sequences i3 with i3 % ne33 == list/iter_j read it
+    int i3_start = list / (n_lists/ne33);
+    int i3_step  = ne33;
+    int i1;
+    if (slot < n_kv_max) {
+        i1 = indices[int64_t(list)*n_kv_max + slot];
+        if (i1 < 0) {
+            return;
+        }
+    } else if (slot == n_kv_max && list == 0) {
+        // padded slots of every list gather row 0 of every sequence, the -inf mask removes their contribution
+        i1       = 0;
+        i3_start = 0;
+        i3_step  = 1;
+    } else {
+        return;
+    }
+
+    for (int i3 = i3_start; i3 < ne3; i3 += i3_step) {
+        const char * x_row = x + i3*nb3 + i2*nb2 + i1*nb1;
+        half       * y_row = y + ((int64_t(i3)*ne2 + i2)*ne1 + i1)*ne0;
+
+        for (int i0 = 2*threadIdx.x; i0 < ne0; i0 += 2*blockDim.x) {
+            const int ib   = i0/qk;
+            const int iqs  = (i0%qk)/qr;
+            const int iybs = i0 - i0%qk;
+
+            float2 v;
+            dequantize_kernel(x_row, ib, iqs, v);
+
+            if constexpr (qr == 1) {
+                *((half2 *) (y_row + iybs + iqs)) = __float22half2_rn(v);
+            } else {
+                y_row[iybs + iqs +    0] = __float2half(v.x);
+                y_row[iybs + iqs + qk/2] = __float2half(v.y);
+            }
+        }
+    }
+}
+
+template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
+static void flash_attn_sparse_rows_to_f16_cuda(
+        const ggml_tensor * t, half * dst, const int32_t * indices, const int n_lists, const int ne33, const int n_kv_max,
+        cudaStream_t stream) {
+    GGML_ASSERT(t->ne[0] % qk == 0 && t->ne[0] % 2 == 0);
+    GGML_ASSERT(n_lists % ne33 == 0);
+
+    constexpr int rows_per_block = 4;
+    const dim3 blocks_num((n_kv_max + 1 + rows_per_block - 1)/rows_per_block, n_lists, t->ne[2]);
+    const dim3 block_dim(WARP_SIZE, rows_per_block, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_sparse_rows_to_f16<qk, qr, dequantize_kernel>, launch_params,
+        (const char *) t->data, dst, indices, int(t->ne[0]), int(t->ne[1]), int(t->ne[2]), int(t->ne[3]),
+        ne33, n_lists, n_kv_max, int64_t(t->nb[1]), int64_t(t->nb[2]), int64_t(t->nb[3]));
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void ggml_cuda_flash_attn_ext_sparse_to_f16(
+        const ggml_tensor * t, half * dst, const int32_t * indices, int32_t n_lists, int32_t ne33, int32_t n_kv_max, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+#else
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            flash_attn_sparse_rows_to_f16_cuda<1, 1, flash_attn_convert_unary<float>>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            break;
+        case GGML_TYPE_BF16:
+            flash_attn_sparse_rows_to_f16_cuda<1, 1, flash_attn_convert_unary<nv_bfloat16>>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            break;
+        case GGML_TYPE_Q4_0:
+            flash_attn_sparse_rows_to_f16_cuda<QK4_0, QR4_0, dequantize_q4_0>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            break;
+        case GGML_TYPE_Q4_1:
+            flash_attn_sparse_rows_to_f16_cuda<QK4_1, QR4_1, dequantize_q4_1>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            break;
+        case GGML_TYPE_Q5_0:
+            flash_attn_sparse_rows_to_f16_cuda<QK5_0, QR5_0, dequantize_q5_0>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            flash_attn_sparse_rows_to_f16_cuda<QK5_1, QR5_1, dequantize_q5_1>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            flash_attn_sparse_rows_to_f16_cuda<QK8_0, QR8_0, dequantize_q8_0>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            break;
+        default:
+            GGML_ABORT("%s: unsupported type %s", __func__, ggml_type_name(t->type));
+    }
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1) {
@@ -625,16 +738,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
+            // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
+            // quantized K/V are gathered too: only the rows in the sparse index lists are converted to f16
+            const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 &&
+                ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
+                ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1);
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-                // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
-                const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 &&
-                    ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
-                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1);
                 if (!sparse_decode && cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 &&
                         !(gqa_ratio > 4 && (Q->ne[0] >= 256 || K->ne[1] >= 8192))) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
-            } else {
+            } else if (!sparse_decode) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
