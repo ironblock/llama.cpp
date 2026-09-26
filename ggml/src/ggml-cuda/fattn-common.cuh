@@ -721,9 +721,11 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
-// converts only the rows of t referenced by the sparse index lists (and row 0) to a contiguous f16 tensor
+// converts only the rows of t referenced by the sparse index lists (and row 0) to f16 in [ne0, ne2, ne1, ne3] order,
+//     rows_done is a zeroed bitmap of ne33*ceil(ne1/32) words used to convert each row once
 void ggml_cuda_flash_attn_ext_sparse_to_f16(
-        const ggml_tensor * t, half * dst, const int32_t * indices, int32_t n_lists, int32_t ne33, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * t, half * dst, const int32_t * indices, uint32_t * rows_done, int32_t n_lists, int32_t ne33,
+        int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1013,9 +1015,10 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
-    ggml_cuda_pool_alloc<int>    KV_max(pool);
-    ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-    ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+    ggml_cuda_pool_alloc<int>      KV_max(pool);
+    ggml_cuda_pool_alloc<uint32_t> rows_done(pool); // allocated after KV_max and before dst_tmp, keep this order for the VMM pool
+    ggml_cuda_pool_alloc<float>    dst_tmp(pool);
+    ggml_cuda_pool_alloc<float2>   dst_tmp_meta(pool);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1050,6 +1053,12 @@ void launch_fattn(
     //     which padded slots gather) to f16. The kernel never reads the other rows of the f16 buffers.
     const bool sparse_to_f16 = use_sparse && int64_t(ntiles_x)*n_kv_max < K->ne[1];
 
+    const size_t n_rows_done = sparse_to_f16 ? size_t(mask->ne[3])*((K->ne[1] + 31)/32) : 0;
+    if (sparse_to_f16 && ((need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16))) {
+        rows_done.alloc(2*n_rows_done);
+        CUDA_CHECK(cudaMemsetAsync(rows_done.ptr, 0, 2*n_rows_done*sizeof(uint32_t), main_stream));
+    }
+
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
@@ -1057,11 +1066,11 @@ void launch_fattn(
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
         if (sparse_to_f16) {
-            ggml_cuda_flash_attn_ext_sparse_to_f16(K, K_f16, KV_max.ptr, ntiles_x*mask->ne[3], mask->ne[3], n_kv_max, main_stream);
+            ggml_cuda_flash_attn_ext_sparse_to_f16(K, K_f16, KV_max.ptr, rows_done.ptr, ntiles_x*mask->ne[3], mask->ne[3], n_kv_max, main_stream);
 
-            nb11 = K->ne[0] * sizeof(half);
-            nb12 = K->ne[1] * nb11;
-            nb13 = K->ne[2] * nb12;
+            nb12 = K->ne[0] * sizeof(half);
+            nb11 = K->ne[2] * nb12;
+            nb13 = K->ne[1] * nb11;
         } else if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
@@ -1097,11 +1106,11 @@ void launch_fattn(
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
             if (sparse_to_f16) {
-                ggml_cuda_flash_attn_ext_sparse_to_f16(V, V_f16, KV_max.ptr, ntiles_x*mask->ne[3], mask->ne[3], n_kv_max, main_stream);
+                ggml_cuda_flash_attn_ext_sparse_to_f16(V, V_f16, KV_max.ptr, rows_done.ptr + n_rows_done, ntiles_x*mask->ne[3], mask->ne[3], n_kv_max, main_stream);
 
-                nb21 = V->ne[0] * sizeof(half);
-                nb22 = V->ne[1] * nb21;
-                nb23 = V->ne[2] * nb22;
+                nb22 = V->ne[0] * sizeof(half);
+                nb21 = V->ne[2] * nb22;
+                nb23 = V->ne[1] * nb21;
             } else if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);

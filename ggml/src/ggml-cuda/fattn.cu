@@ -125,53 +125,69 @@ static __device__ __forceinline__ void flash_attn_convert_unary(const void * vx,
     v.y = ggml_cuda_cast<float>(x[ib + iqs + 1]);
 }
 
-// converts the K/V rows referenced by the sparse index lists to f16, one warp per (list, slot, head)
-// the destination is a contiguous [ne0, ne1, ne2, ne3] f16 tensor, rows that no list references are left untouched
+// converts the K/V rows referenced by the sparse index lists to f16, one warp per (list, slot)
+// the destination is a contiguous [ne0, ne2, ne1, ne3] f16 tensor (the cell-major order of the KV cache),
+//     rows that no list references are left untouched
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __global__ void flash_attn_sparse_rows_to_f16(
-        const char * x, half * y, const int32_t * indices, const int ne0, const int ne1, const int ne2, const int ne3,
-        const int ne33, const int n_lists, const int n_kv_max, const int64_t nb1, const int64_t nb2, const int64_t nb3) {
+        const char * x, half * y, const int32_t * indices, uint32_t * rows_done,
+        const int ne0, const int ne1, const int ne2, const int ne3, const int ne33, const int n_lists, const int n_kv_max,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3) {
     ggml_cuda_pdl_sync();
 
-    const int list = blockIdx.y;
-    const int slot = blockIdx.x*blockDim.y + threadIdx.y;
-    const int i2   = blockIdx.z;
+    const int slot    = blockIdx.x*blockDim.y + threadIdx.y;
+    const int iter_j  = n_lists / ne33;
+    const int n_words = (ne1 + 31) / 32;
 
-    // list == (sequence % ne33)*iter_j + jt, the K/V sequences i3 with i3 % ne33 == list/iter_j read it
-    int i3_start = list / (n_lists/ne33);
-    int i3_step  = ne33;
-    int i1;
-    if (slot < n_kv_max) {
-        i1 = indices[int64_t(list)*n_kv_max + slot];
-        if (i1 < 0) {
-            return;
+    for (int list = blockIdx.y; list < n_lists; list += gridDim.y) {
+        // list == (sequence % ne33)*iter_j + jt, the K/V sequences i3 with i3 % ne33 == list/iter_j read it
+        int i1 = -1;
+        int s33_start = list / iter_j;
+        int s33_stop  = s33_start + 1;
+        if (slot < n_kv_max) {
+            i1 = indices[int64_t(list)*n_kv_max + slot];
+        } else if (slot == n_kv_max && list == 0) {
+            // padded slots of every list gather row 0, the -inf mask removes their contribution
+            i1        = 0;
+            s33_start = 0;
+            s33_stop  = ne33;
         }
-    } else if (slot == n_kv_max && list == 0) {
-        // padded slots of every list gather row 0 of every sequence, the -inf mask removes their contribution
-        i1       = 0;
-        i3_start = 0;
-        i3_step  = 1;
-    } else {
-        return;
-    }
+        if (i1 < 0) {
+            continue;
+        }
 
-    for (int i3 = i3_start; i3 < ne3; i3 += i3_step) {
-        const char * x_row = x + i3*nb3 + i2*nb2 + i1*nb1;
-        half       * y_row = y + ((int64_t(i3)*ne2 + i2)*ne1 + i1)*ne0;
+        for (int s33 = s33_start; s33 < s33_stop; ++s33) {
+            // lists of the same sequence share rows, only the first warp to claim a row converts it
+            uint32_t done = 0;
+            if (threadIdx.x == 0) {
+                done = atomicOr(rows_done + int64_t(s33)*n_words + i1/32, 1u << (i1 % 32));
+            }
+            done = __shfl_sync(0xFFFFFFFF, done, 0);
+            if (done & (1u << (i1 % 32))) {
+                continue;
+            }
 
-        for (int i0 = 2*threadIdx.x; i0 < ne0; i0 += 2*blockDim.x) {
-            const int ib   = i0/qk;
-            const int iqs  = (i0%qk)/qr;
-            const int iybs = i0 - i0%qk;
+            for (int i3 = s33; i3 < ne3; i3 += ne33) {
+                for (int i2 = 0; i2 < ne2; ++i2) {
+                    const char * x_row = x + i3*nb3 + i2*nb2 + int64_t(i1)*nb1;
+                    half       * y_row = y + ((int64_t(i3)*ne1 + i1)*ne2 + i2)*ne0;
 
-            float2 v;
-            dequantize_kernel(x_row, ib, iqs, v);
+                    for (int i0 = 2*threadIdx.x; i0 < ne0; i0 += 2*blockDim.x) {
+                        const int ib   = i0/qk;
+                        const int iqs  = (i0%qk)/qr;
+                        const int iybs = i0 - i0%qk;
 
-            if constexpr (qr == 1) {
-                *((half2 *) (y_row + iybs + iqs)) = __float22half2_rn(v);
-            } else {
-                y_row[iybs + iqs +    0] = __float2half(v.x);
-                y_row[iybs + iqs + qk/2] = __float2half(v.y);
+                        float2 v;
+                        dequantize_kernel(x_row, ib, iqs, v);
+
+                        if constexpr (qr == 1) {
+                            *((half2 *) (y_row + iybs + iqs)) = __float22half2_rn(v);
+                        } else {
+                            y_row[iybs + iqs +    0] = __float2half(v.x);
+                            y_row[iybs + iqs + qk/2] = __float2half(v.y);
+                        }
+                    }
+                }
             }
         }
     }
@@ -179,49 +195,51 @@ static __global__ void flash_attn_sparse_rows_to_f16(
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static void flash_attn_sparse_rows_to_f16_cuda(
-        const ggml_tensor * t, half * dst, const int32_t * indices, const int n_lists, const int ne33, const int n_kv_max,
-        cudaStream_t stream) {
+        const ggml_tensor * t, half * dst, const int32_t * indices, uint32_t * rows_done, const int n_lists, const int ne33,
+        const int n_kv_max, cudaStream_t stream) {
+    GGML_ASSERT(WARP_SIZE == 32);
     GGML_ASSERT(t->ne[0] % qk == 0 && t->ne[0] % 2 == 0);
     GGML_ASSERT(n_lists % ne33 == 0);
 
     constexpr int rows_per_block = 4;
-    const dim3 blocks_num((n_kv_max + 1 + rows_per_block - 1)/rows_per_block, n_lists, t->ne[2]);
+    const dim3 blocks_num((n_kv_max + 1 + rows_per_block - 1)/rows_per_block, std::min(n_lists, 65535), 1);
     const dim3 block_dim(WARP_SIZE, rows_per_block, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     ggml_cuda_kernel_launch(flash_attn_sparse_rows_to_f16<qk, qr, dequantize_kernel>, launch_params,
-        (const char *) t->data, dst, indices, int(t->ne[0]), int(t->ne[1]), int(t->ne[2]), int(t->ne[3]),
+        (const char *) t->data, dst, indices, rows_done, int(t->ne[0]), int(t->ne[1]), int(t->ne[2]), int(t->ne[3]),
         ne33, n_lists, n_kv_max, int64_t(t->nb[1]), int64_t(t->nb[2]), int64_t(t->nb[3]));
     CUDA_CHECK(cudaGetLastError());
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_sparse_to_f16(
-        const ggml_tensor * t, half * dst, const int32_t * indices, int32_t n_lists, int32_t ne33, int32_t n_kv_max, cudaStream_t stream) {
+        const ggml_tensor * t, half * dst, const int32_t * indices, uint32_t * rows_done, int32_t n_lists, int32_t ne33,
+        int32_t n_kv_max, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+    GGML_UNUSED_VARS(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
 #else
     switch (t->type) {
         case GGML_TYPE_F32:
-            flash_attn_sparse_rows_to_f16_cuda<1, 1, flash_attn_convert_unary<float>>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            flash_attn_sparse_rows_to_f16_cuda<1, 1, flash_attn_convert_unary<float>>(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
             break;
         case GGML_TYPE_BF16:
-            flash_attn_sparse_rows_to_f16_cuda<1, 1, flash_attn_convert_unary<nv_bfloat16>>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            flash_attn_sparse_rows_to_f16_cuda<1, 1, flash_attn_convert_unary<nv_bfloat16>>(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
             break;
         case GGML_TYPE_Q4_0:
-            flash_attn_sparse_rows_to_f16_cuda<QK4_0, QR4_0, dequantize_q4_0>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            flash_attn_sparse_rows_to_f16_cuda<QK4_0, QR4_0, dequantize_q4_0>(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
             break;
         case GGML_TYPE_Q4_1:
-            flash_attn_sparse_rows_to_f16_cuda<QK4_1, QR4_1, dequantize_q4_1>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            flash_attn_sparse_rows_to_f16_cuda<QK4_1, QR4_1, dequantize_q4_1>(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
             break;
         case GGML_TYPE_Q5_0:
-            flash_attn_sparse_rows_to_f16_cuda<QK5_0, QR5_0, dequantize_q5_0>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            flash_attn_sparse_rows_to_f16_cuda<QK5_0, QR5_0, dequantize_q5_0>(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
             break;
         case GGML_TYPE_Q5_1:
-            flash_attn_sparse_rows_to_f16_cuda<QK5_1, QR5_1, dequantize_q5_1>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            flash_attn_sparse_rows_to_f16_cuda<QK5_1, QR5_1, dequantize_q5_1>(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
             break;
         case GGML_TYPE_Q8_0:
-            flash_attn_sparse_rows_to_f16_cuda<QK8_0, QR8_0, dequantize_q8_0>(t, dst, indices, n_lists, ne33, n_kv_max, stream);
+            flash_attn_sparse_rows_to_f16_cuda<QK8_0, QR8_0, dequantize_q8_0>(t, dst, indices, rows_done, n_lists, ne33, n_kv_max, stream);
             break;
         default:
             GGML_ABORT("%s: unsupported type %s", __func__, ggml_type_name(t->type));

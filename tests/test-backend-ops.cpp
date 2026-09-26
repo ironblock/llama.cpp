@@ -10872,6 +10872,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // ncols1 == 8 tiles, gathered rows fewer than K rows (converted sparsely) and more (converted in full)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 48, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false,  512));
+    // KV cache memory layout (cells major, heads minor), F32 K/V, and MLA shapes where V is a view of K
+    for (int nb : {1, 4, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, nb == 16 ? 512 : 2048));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2},  8192,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32,  GGML_TYPE_F32,  {0, 1, 2, 3}, true, false, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false,  512));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true,   512));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1},  8192,  3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, true,   512));
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -11343,8 +11352,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // Sparse flash attention with a quantized cache, Qwen QSA shape, decode and speculative verify batches.
-    for (int64_t kv : {65536, 131072}) {
+    for (int64_t kv : {8192, 16384, 65536, 131072}) {
         for (int nb : {1, 2, 4, 16}) {
+            if (kv < 2*nb*2048) {
+                continue;
+            }
             for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 2048));
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false,    0));
