@@ -162,6 +162,27 @@ llama_context::llama_context(
         }
     }
 
+    // qwen4exp shared MTP head: a head-only sidecar without token_embd/output borrows the target's.
+    // Only the two weight pointers are borrowed. cparams.ctx_other stays null on purpose: for MTP a
+    // non-null ctx_other means "shares the target's KV" (the gemma4 path), which this head does not.
+    if (model.arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            (model.tok_embd == nullptr || model.output == nullptr)) {
+        if (params.ctx_other == nullptr) {
+            throw std::runtime_error("qwen4exp shared MTP head requires ctx_other (the target context) to borrow token_embd/output (this warning is normal during memory fitting)");
+        }
+        const llama_model * tgt = llama_get_model(params.ctx_other);
+        auto & m = const_cast<llama_model &>(model);
+        if (m.tok_embd == nullptr) {
+            m.tok_embd = tgt->tok_embd;
+        }
+        if (m.output == nullptr) {
+            m.output   = tgt->output;
+            m.output_s = tgt->output_s;
+        }
+        GGML_ASSERT(m.tok_embd && m.output && "qwen4exp shared MTP head: target has no token_embd/output to borrow");
+        LLAMA_LOG_INFO("%s: qwen4exp shared MTP head: borrowing token_embd and output from the target model\n", __func__);
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }

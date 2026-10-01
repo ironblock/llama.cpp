@@ -168,7 +168,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a shared head-only sidecar omits token_embd and output; llama_context borrows the target's
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, mtp_only ? TENSOR_NOT_REQUIRED : 0);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -177,7 +178,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
+    if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
